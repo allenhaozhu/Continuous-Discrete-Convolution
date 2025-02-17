@@ -123,6 +123,58 @@ class BasicBlock(nn.Module):
         out = self.output(x) + identity
         return out
 
+# class BasicBlock(nn.Module):
+#     def __init__(self,
+#                  r: float,
+#                  l: float,
+#                  kernel_channels: list[int],
+#                  in_channels: int,
+#                  out_channels: int,
+#                  base_width: float = 16.0,
+#                  batch_norm: bool = True,
+#                  dropout: float = 0.0,
+#                  bias: bool = False,
+#                  leakyrelu_negative_slope: float = 0.1,
+#                  momentum: float = 0.2) -> nn.Module:
+
+#         super(BasicBlock, self).__init__()
+
+#         if in_channels != out_channels:
+#             self.identity = Linear(in_channels=in_channels,
+#                                   out_channels=out_channels,
+#                                   batch_norm=batch_norm,
+#                                   dropout=dropout,
+#                                   bias=bias,
+#                                   leakyrelu_negative_slope=leakyrelu_negative_slope,
+#                                   momentum=momentum)
+#         else:
+#             self.identity = nn.Sequential()
+
+#         width = int(out_channels * (base_width / 64.))
+#         self.input = MLP(in_channels=in_channels,
+#                          mid_channels=None,
+#                          out_channels=width,
+#                          batch_norm=batch_norm,
+#                          dropout=dropout,
+#                          bias=bias,
+#                          leakyrelu_negative_slope=leakyrelu_negative_slope,
+#                          momentum=momentum)
+#         self.conv = TSMConv(r=r, l=l, kernel_channels=kernel_channels, in_channels=width, out_channels=width)
+#         self.output = Linear(in_channels=width,
+#                              out_channels=out_channels,
+#                              batch_norm=batch_norm,
+#                              dropout=dropout,
+#                              bias=bias,
+#                              leakyrelu_negative_slope=leakyrelu_negative_slope,
+#                              momentum=momentum)
+
+#     def forward(self, x, pos, seq, ori, batch):
+#         identity = self.identity(x)
+#         x = self.input(x)
+#         x = self.conv(x, pos, seq, ori, batch)
+#         out = self.output(x) + identity
+#         return out
+
 class Model(nn.Module):
     def __init__(self,
                  geometric_radii: List[float],
