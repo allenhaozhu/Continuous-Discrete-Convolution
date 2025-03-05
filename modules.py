@@ -402,3 +402,137 @@ class TSMConv(MessagePassing):
             accumulated_messages += msg
             
         return accumulated_messages
+
+# ... existing imports ...
+from modules import GeometrySequenceAttention
+
+class GSATransformerBlock(nn.Module):
+    def __init__(self,
+                 r: float,
+                 l: float,
+                 hidden_dim: int,
+                 in_channels: int,
+                 out_channels: int,
+                 num_heads: int = 4,
+                 batch_norm: bool = True,
+                 dropout: float = 0.0,
+                 bias: bool = False) -> nn.Module:
+        super().__init__()
+        
+        self.norm1 = nn.LayerNorm(in_channels) if batch_norm else nn.Identity()
+        self.norm2 = nn.LayerNorm(out_channels) if batch_norm else nn.Identity()
+        
+        # Multi-head Geometry-Sequence Attention
+        self.attention_heads = nn.ModuleList([
+            GeometrySequenceAttention(
+                r=r, l=l, 
+                hidden_dim=hidden_dim,
+                in_channels=in_channels,
+                out_channels=out_channels//num_heads
+            ) for _ in range(num_heads)
+        ])
+        
+        # FFN
+        self.ffn = MLP(
+            in_channels=out_channels,
+            mid_channels=out_channels * 4,
+            out_channels=out_channels,
+            batch_norm=batch_norm,
+            dropout=dropout,
+            bias=bias
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, pos, seq, ori, batch):
+        # Multi-head attention
+        identity = x
+        x = self.norm1(x)
+        
+        # Parallel attention heads
+        att_outputs = []
+        for head in self.attention_heads:
+            att_outputs.append(head(x, pos, seq, ori, batch))
+        x = torch.cat(att_outputs, dim=-1)
+        
+        x = self.dropout(x)
+        x = x + identity
+        
+        # FFN
+        identity = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = self.dropout(x)
+        x = x + identity
+        
+        return x
+
+class GSATransformer(nn.Module):
+    def __init__(self,
+                 geometric_radii: List[float],
+                 sequential_length: float,
+                 channels: List[int],
+                 hidden_dim: int = 64,
+                 num_heads: int = 4,
+                 embedding_dim: int = 16,
+                 batch_norm: bool = True,
+                 dropout: float = 0.2,
+                 bias: bool = False,
+                 num_classes: int = 384) -> nn.Module:
+        super().__init__()
+        
+        self.embedding = nn.Embedding(21, embedding_dim)
+        self.input_proj = Linear(embedding_dim, channels[0], batch_norm, dropout)
+        self.local_mean_pool = AvgPooling()
+        
+        # Build transformer blocks
+        layers = []
+        in_channels = channels[0]
+        for i, (radius, out_channels) in enumerate(zip(geometric_radii, channels)):
+            # Two transformer blocks per level
+            for _ in range(2):
+                layers.append(
+                    GSATransformerBlock(
+                        r=radius,
+                        l=sequential_length,
+                        hidden_dim=hidden_dim,
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        num_heads=num_heads,
+                        batch_norm=batch_norm,
+                        dropout=dropout,
+                        bias=bias
+                    )
+                )
+                in_channels = out_channels
+                
+        self.layers = nn.ModuleList(layers)
+        
+        # Final classifier
+        self.classifier = MLP(
+            in_channels=channels[-1],
+            mid_channels=max(channels[-1], num_classes),
+            out_channels=num_classes,
+            batch_norm=batch_norm,
+            dropout=dropout
+        )
+
+    def forward(self, data):
+        # Initial embedding
+        x = self.embedding(data.x)
+        x = self.input_proj(x)
+        pos, seq, ori, batch = data.pos, data.seq, data.ori, data.batch
+        
+        # Process through transformer blocks
+        for i, layer in enumerate(self.layers):
+            x = layer(x, pos, seq, ori, batch)
+            
+            # Apply pooling between levels
+            if i == len(self.layers) - 1:
+                x = global_mean_pool(x, batch)
+            elif i % 2 == 1:
+                x, pos, seq, ori, batch = self.local_mean_pool(x, pos, seq, ori, batch)
+        
+        # Classification
+        out = self.classifier(x)
+        return out
