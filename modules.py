@@ -403,8 +403,84 @@ class TSMConv(MessagePassing):
             
         return accumulated_messages
 
-# ... existing imports ...
-from modules import GeometrySequenceAttention
+class GeometrySequenceAttention(MessagePassing):
+    def __init__(self, r: float, l: int, hidden_dim: int, in_channels: int, out_channels: int, add_self_loops: bool = True):
+        super().__init__(aggr='sum')
+        self.r = r  # radius for neighborhood
+        self.l = l  # sequence length parameter
+        
+        # Key and Query networks for geometric-sequential features
+        self.key_network = nn.Sequential(
+            nn.Linear(7, hidden_dim),  # 3(pos) + 3(ori) + 1(dist)
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Sequence embedding
+        self.seq_embedding = nn.Parameter(torch.empty(l, hidden_dim))
+        
+        # Value transformation
+        self.value_transform = nn.Linear(in_channels, out_channels)
+        
+        self.add_self_loops = add_self_loops
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for layer in self.key_network.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_uniform_(layer.weight)
+                if layer.bias is not None:
+                    layer.bias.data.fill_(0)
+        nn.init.kaiming_uniform_(self.seq_embedding)
+        nn.init.kaiming_uniform_(self.value_transform.weight)
+        self.value_transform.bias.data.fill_(0)
+
+    def forward(self, x, pos, seq, ori, batch):
+        row, col = radius(pos, pos, self.r, batch, batch, max_num_neighbors=9999)
+        edge_index = torch.stack([col, row], dim=0)
+
+        if self.add_self_loops:
+            edge_index, _ = remove_self_loops(edge_index)
+            edge_index, _ = add_self_loops(edge_index, num_nodes=pos.size(0))
+
+        out = self.propagate(edge_index, x=(x, None), pos=(pos, pos), 
+                           seq=(seq, seq), ori=(ori.reshape(-1, 9), ori.reshape(-1, 9)))
+        return out
+
+    def message(self, x_j, pos_i, pos_j, seq_i, seq_j, ori_i, ori_j):
+        # Compute geometric features
+        pos_rel = pos_j - pos_i
+        distance = torch.norm(pos_rel, p=2, dim=-1, keepdim=True)
+        pos_rel = pos_rel / (distance + 1e-9)
+        
+        # Transform position to local coordinate system
+        pos_local = torch.matmul(ori_i.reshape(-1, 3, 3), pos_rel.unsqueeze(2)).squeeze(2)
+        
+        # Compute orientation similarity
+        ori_sim = torch.sum(ori_i.reshape(-1, 3, 3) * ori_j.reshape(-1, 3, 3), dim=2)
+        
+        # Sequence-aware attention
+        seq_rel = seq_j - seq_i
+        s = self.l // 2
+        seq_rel = torch.clamp(seq_rel, min=-s, max=s)
+        seq_idx = (seq_rel + s).squeeze(1).to(torch.int64)
+        seq_weights = torch.index_select(self.seq_embedding, 0, seq_idx)
+        
+        # Compute attention weights
+        geom_features = torch.cat([pos_local, ori_sim, distance], dim=1)
+        attention_weights = self.key_network(geom_features)
+        attention_weights = attention_weights * seq_weights
+        
+        # Distance-based damping
+        smooth = 0.5 - torch.tanh(distance/self.r * torch.abs(seq_rel)/s * 16.0 - 14.0) * 0.5
+        attention_weights = attention_weights * smooth.unsqueeze(-1)
+        
+        # Transform values
+        values = self.value_transform(x_j)
+        
+        # Apply attention
+        return values * attention_weights.sum(dim=-1, keepdim=True)
+
 
 class GSATransformerBlock(nn.Module):
     def __init__(self,
