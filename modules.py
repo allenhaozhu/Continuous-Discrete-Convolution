@@ -403,212 +403,137 @@ class TSMConv(MessagePassing):
             
         return accumulated_messages
 
-class GeometrySequenceAttention(MessagePassing):
-    def __init__(self, r: float, l: int, hidden_dim: int, in_channels: int, out_channels: int, add_self_loops: bool = True):
-        super().__init__(aggr='sum')
-        self.r = r  # radius for neighborhood
-        self.l = l  # sequence length parameter
-        
-        # Key and Query networks for geometric-sequential features
-        self.key_network = nn.Sequential(
-            nn.Linear(7, hidden_dim),  # 3(pos) + 3(ori) + 1(dist)
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        # Sequence embedding
-        self.seq_embedding = nn.Parameter(torch.empty(l, hidden_dim))
-        
-        # Value transformation
-        self.value_transform = nn.Linear(in_channels, out_channels)
-        
-        self.add_self_loops = add_self_loops
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        for layer in self.key_network.modules():
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_uniform_(layer.weight)
-                if layer.bias is not None:
-                    layer.bias.data.fill_(0)
-        nn.init.kaiming_uniform_(self.seq_embedding)
-        nn.init.kaiming_uniform_(self.value_transform.weight)
-        self.value_transform.bias.data.fill_(0)
-
-    def forward(self, x, pos, seq, ori, batch):
-        row, col = radius(pos, pos, self.r, batch, batch, max_num_neighbors=9999)
-        edge_index = torch.stack([col, row], dim=0)
-
-        if self.add_self_loops:
-            edge_index, _ = remove_self_loops(edge_index)
-            edge_index, _ = add_self_loops(edge_index, num_nodes=pos.size(0))
-
-        out = self.propagate(edge_index, x=(x, None), pos=(pos, pos), 
-                           seq=(seq, seq), ori=(ori.reshape(-1, 9), ori.reshape(-1, 9)))
-        return out
-
-    def message(self, x_j, pos_i, pos_j, seq_i, seq_j, ori_i, ori_j):
-        # Compute geometric features
-        pos_rel = pos_j - pos_i
-        distance = torch.norm(pos_rel, p=2, dim=-1, keepdim=True)
-        pos_rel = pos_rel / (distance + 1e-9)
-        
-        # Transform position to local coordinate system
-        pos_local = torch.matmul(ori_i.reshape(-1, 3, 3), pos_rel.unsqueeze(2)).squeeze(2)
-        
-        # Compute orientation similarity
-        ori_sim = torch.sum(ori_i.reshape(-1, 3, 3) * ori_j.reshape(-1, 3, 3), dim=2)
-        
-        # Sequence-aware attention
-        seq_rel = seq_j - seq_i
-        s = self.l // 2
-        seq_rel = torch.clamp(seq_rel, min=-s, max=s)
-        seq_idx = (seq_rel + s).squeeze(1).to(torch.int64)
-        seq_weights = torch.index_select(self.seq_embedding, 0, seq_idx)
-        
-        # Compute attention weights
-        geom_features = torch.cat([pos_local, ori_sim, distance], dim=1)
-        attention_weights = self.key_network(geom_features)
-        attention_weights = attention_weights * seq_weights
-        
-        # Distance-based damping
-        smooth = 0.5 - torch.tanh(distance/self.r * torch.abs(seq_rel)/s * 16.0 - 14.0) * 0.5
-        attention_weights = attention_weights * smooth.unsqueeze(-1)
-        
-        # Transform values
-        values = self.value_transform(x_j)
-        
-        # Apply attention
-        return values * attention_weights.sum(dim=-1, keepdim=True)
-
-
 class GSATransformerBlock(nn.Module):
     def __init__(self,
                  r: float,
                  l: float,
-                 hidden_dim: int,
+                 kernel_channels: list[int],  # Keep for interface compatibility
                  in_channels: int,
                  out_channels: int,
-                 num_heads: int = 4,
+                 base_width: float = 16.0,
                  batch_norm: bool = True,
                  dropout: float = 0.0,
-                 bias: bool = False) -> nn.Module:
+                 bias: bool = False,
+                 leakyrelu_negative_slope: float = 0.1,
+                 momentum: float = 0.2) -> nn.Module:
         super().__init__()
+
+        if in_channels != out_channels:
+            self.identity = Linear(in_channels=in_channels,
+                                 out_channels=out_channels,
+                                 batch_norm=batch_norm,
+                                 dropout=dropout,
+                                 bias=bias,
+                                 leakyrelu_negative_slope=leakyrelu_negative_slope,
+                                 momentum=momentum)
+        else:
+            self.identity = nn.Sequential()
+
+        width = int(out_channels * (base_width / 64.))
+        hidden_dim = width // 4  # For attention mechanism
         
-        self.norm1 = nn.LayerNorm(in_channels) if batch_norm else nn.Identity()
-        self.norm2 = nn.LayerNorm(out_channels) if batch_norm else nn.Identity()
-        
-        # Multi-head Geometry-Sequence Attention
+        self.input = MLP(in_channels=in_channels,
+                        mid_channels=None,
+                        out_channels=width,
+                        batch_norm=batch_norm,
+                        dropout=dropout,
+                        bias=bias,
+                        leakyrelu_negative_slope=leakyrelu_negative_slope,
+                        momentum=momentum)
+
+        # Multi-head attention with different radii
         self.attention_heads = nn.ModuleList([
             GeometrySequenceAttention(
-                r=r, l=l, 
+                r=r * scale,
+                l=l,
                 hidden_dim=hidden_dim,
-                in_channels=in_channels,
-                out_channels=out_channels//num_heads
-            ) for _ in range(num_heads)
+                in_channels=width,
+                out_channels=width//4
+            ) for scale in [2.0, 3.0, 4.0, 5.0]
         ])
-        
-        # FFN
-        self.ffn = MLP(
-            in_channels=out_channels,
-            mid_channels=out_channels * 4,
-            out_channels=out_channels,
-            batch_norm=batch_norm,
-            dropout=dropout,
-            bias=bias
-        )
-        
-        self.dropout = nn.Dropout(dropout)
+
+        self.output = Linear(in_channels=width,
+                           out_channels=out_channels,
+                           batch_norm=batch_norm,
+                           dropout=dropout,
+                           bias=bias,
+                           leakyrelu_negative_slope=leakyrelu_negative_slope,
+                           momentum=momentum)
 
     def forward(self, x, pos, seq, ori, batch):
-        # Multi-head attention
-        identity = x
-        x = self.norm1(x)
+        identity = self.identity(x)
+        x = self.input(x)
         
-        # Parallel attention heads
+        # Multi-head attention
         att_outputs = []
         for head in self.attention_heads:
             att_outputs.append(head(x, pos, seq, ori, batch))
         x = torch.cat(att_outputs, dim=-1)
         
-        x = self.dropout(x)
-        x = x + identity
-        
-        # FFN
-        identity = x
-        x = self.norm2(x)
-        x = self.ffn(x)
-        x = self.dropout(x)
-        x = x + identity
-        
-        return x
+        out = self.output(x) + identity
+        return out
 
 class GSATransformer(nn.Module):
     def __init__(self,
                  geometric_radii: List[float],
-                 sequential_length: float,
+                 sequential_kernel_size: float,
+                 kernel_channels: List[int],
                  channels: List[int],
-                 hidden_dim: int = 64,
-                 num_heads: int = 4,
+                 base_width: float = 16.0,
                  embedding_dim: int = 16,
                  batch_norm: bool = True,
                  dropout: float = 0.2,
                  bias: bool = False,
                  num_classes: int = 384) -> nn.Module:
         super().__init__()
-        
-        self.embedding = nn.Embedding(21, embedding_dim)
-        self.input_proj = Linear(embedding_dim, channels[0], batch_norm, dropout)
+
+        assert (len(geometric_radii) == len(channels)), "GSATransformer: 'geometric_radii' and 'channels' should have the same number of elements!"
+
+        self.embedding = torch.nn.Embedding(num_embeddings=21, embedding_dim=embedding_dim)
         self.local_mean_pool = AvgPooling()
-        
-        # Build transformer blocks
+
         layers = []
-        in_channels = channels[0]
-        for i, (radius, out_channels) in enumerate(zip(geometric_radii, channels)):
-            # Two transformer blocks per level
-            for _ in range(2):
-                layers.append(
-                    GSATransformerBlock(
-                        r=radius,
-                        l=sequential_length,
-                        hidden_dim=hidden_dim,
-                        in_channels=in_channels,
-                        out_channels=out_channels,
-                        num_heads=num_heads,
-                        batch_norm=batch_norm,
-                        dropout=dropout,
-                        bias=bias
-                    )
-                )
-                in_channels = out_channels
-                
-        self.layers = nn.ModuleList(layers)
-        
-        # Final classifier
-        self.classifier = MLP(
-            in_channels=channels[-1],
-            mid_channels=max(channels[-1], num_classes),
-            out_channels=num_classes,
-            batch_norm=batch_norm,
-            dropout=dropout
-        )
+        in_channels = embedding_dim
+        for i, radius in enumerate(geometric_radii):
+            layers.append(GSATransformerBlock(
+                r=radius,
+                l=sequential_kernel_size,
+                kernel_channels=kernel_channels,
+                in_channels=in_channels,
+                out_channels=channels[i],
+                base_width=base_width,
+                batch_norm=batch_norm,
+                dropout=dropout,
+                bias=bias))
+            layers.append(GSATransformerBlock(
+                r=radius,
+                l=sequential_kernel_size,
+                kernel_channels=kernel_channels,
+                in_channels=channels[i],
+                out_channels=channels[i],
+                base_width=base_width,
+                batch_norm=batch_norm,
+                dropout=dropout,
+                bias=bias))
+            in_channels = channels[i]
+
+        self.layers = nn.Sequential(*layers)
+
+        self.classifier = MLP(in_channels=channels[-1],
+                            mid_channels=max(channels[-1], num_classes),
+                            out_channels=num_classes,
+                            batch_norm=batch_norm,
+                            dropout=dropout)
 
     def forward(self, data):
-        # Initial embedding
-        x = self.embedding(data.x)
-        x = self.input_proj(x)
-        pos, seq, ori, batch = data.pos, data.seq, data.ori, data.batch
-        
-        # Process through transformer blocks
+        x, pos, seq, ori, batch = (self.embedding(data.x), data.pos, data.seq, data.ori, data.batch)
+
         for i, layer in enumerate(self.layers):
             x = layer(x, pos, seq, ori, batch)
-            
-            # Apply pooling between levels
             if i == len(self.layers) - 1:
                 x = global_mean_pool(x, batch)
             elif i % 2 == 1:
                 x, pos, seq, ori, batch = self.local_mean_pool(x, pos, seq, ori, batch)
-        
-        # Classification
+
         out = self.classifier(x)
         return out
